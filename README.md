@@ -6,6 +6,7 @@ These implementations primarily target tool-focused use cases (such as writing p
 Each library is implemented in its own `.cpp` file and requires no external dependencies aside from the Windows SDK and the included `era.h`.
 
 # Supported Libraries
+* `combase.dll`
 * `EtwPlus.dll`
 * `kernelx.dll`
 * `pixEvt.dll`
