@@ -312,11 +312,14 @@ EXTERN_C BOOL WINAPI EraVirtualFreeEx(
 
         if (dwFreeType == MEM_DECOMMIT)
             return TRUE;
-    
-        dwSize = 0;
+
+        BOOL Status;
+        VirtualFreeEx(hProcess, lpAddress, dwSize, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
         AcquireSRWLockExclusive(&XwpMappableLock);
-        XwpMappables.erase((ULONG_PTR)AllocationBase);
+        Status = VirtualFreeEx(hProcess, lpAddress, 0, MEM_RELEASE);
+        if (Status) XwpMappables.erase((ULONG_PTR)AllocationBase);
         ReleaseSRWLockExclusive(&XwpMappableLock);
+        return Status;
     }
 
     return VirtualFreeEx(hProcess, lpAddress, dwSize, dwFreeType);
