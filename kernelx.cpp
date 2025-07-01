@@ -1,6 +1,6 @@
 #include <era.h>
 #include <bitset>
-#include <unordered_map>
+#include <map>
 
 //
 // Helpers
@@ -120,84 +120,33 @@ EXTERN_C BOOL WINAPI GetThreadName(_In_ HANDLE hThread, _Out_ PWSTR lpThreadName
 #define PAGE_SIZE_2MB (1ULL << 21)
 #define PAGE_SIZE_4MB (1ULL << 22)
 
-static SRWLOCK XwpAllocationLock = SRWLOCK_INIT;
+#define MEM_MASK (MEM_COMMIT | MEM_RESERVE | MEM_RESET | MEM_TOP_DOWN | MEM_WRITE_WATCH | MEM_RESET_UNDO)
+#define PAGE_MASK (PAGE_NOACCESS | PAGE_READONLY | PAGE_READWRITE | PAGE_GUARD)
 
-static std::unordered_map<LPVOID, SIZE_T> XwpAllocations;
-
-static void GetAddressRequirements(_In_opt_ LPVOID lpAddress, _In_ DWORD flAllocationType, _Out_ PMEM_ADDRESS_REQUIREMENTS AddressRequirements)
+// Represents a mappable memory allocation (usable with MapTitlePhysicalPages and D3DMapEsramMemory)
+typedef struct _MAPPABLE_MEM
 {
-    AddressRequirements->LowestStartingAddress = nullptr;
-    AddressRequirements->HighestEndingAddress = nullptr;
-    AddressRequirements->Alignment = 0;
+    ULONG_PTR RegionSize : 63;
+    ULONG_PTR Is4MBPages : 1;
+} MAPPABLE_MEM, *PMAPPABLE_MEM;
 
-    if (flAllocationType & MEM_TOP_DOWN)
-        flAllocationType |= MEM_RESERVE;
+static SRWLOCK XwpMappableLock = SRWLOCK_INIT;
 
-    if (lpAddress || (flAllocationType & (MEM_COMMIT | MEM_RESERVE)) == MEM_COMMIT)
-        return;
+static std::map<ULONG_PTR, MAPPABLE_MEM> XwpMappables;
 
-    if (flAllocationType & MEM_LARGE_PAGES)
-        AddressRequirements->Alignment = PAGE_SIZE_64K;
-
-    if (flAllocationType & MEM_4MB_PAGES)
-        AddressRequirements->Alignment = PAGE_SIZE_4MB;
-
-    // TODO: Does any set of flags use 1 TiB -> 2 TiB? Need to test on hardware.
-    switch (flAllocationType & (MEM_RESERVE | MEM_GRAPHICS | MEM_TITLE))
-    {
-    case MEM_RESERVE | MEM_GRAPHICS: // 4 GiB -> 1 TiB
-        AddressRequirements->LowestStartingAddress = (PVOID)0x100000000ULL;
-        AddressRequirements->HighestEndingAddress = (PVOID)0xFFFFFFFFFFULL;
-        break;
-    case MEM_RESERVE | MEM_TITLE: // 2 TiB -> 4 TiB
-        AddressRequirements->LowestStartingAddress = (PVOID)0x40000000000ULL;
-        AddressRequirements->HighestEndingAddress = (PVOID)0x7FFFFFFFFFFULL;
-        break;
-    case MEM_RESERVE: // 4 TiB -> 8 TiB
-        AddressRequirements->LowestStartingAddress = (PVOID)0x20000000000ULL;
-        AddressRequirements->HighestEndingAddress = (PVOID)0x3FFFFFFFFFFULL;
-        break;
-    }
-}
-
-// TODO: VirtualQuery, VirtualProtect, etc
-
-static BOOL GetAllocationSize(LPVOID lpAddress, SIZE_T *pdwSize)
+static LPVOID MappableQuery(_In_opt_ LPCVOID lpAddress, _Out_ PMAPPABLE_MEM pMappable)
 {
-    if (!pdwSize)
-        return FALSE;
+    auto it = XwpMappables.upper_bound((ULONG_PTR)lpAddress);
 
-    BOOL Result;
-    AcquireSRWLockExclusive(&XwpAllocationLock);
-    auto it = XwpAllocations.find(lpAddress);
-
-    if (it != XwpAllocations.end())
+    if (it == XwpMappables.begin())
     {
-        *pdwSize = it->second;
-        Result = TRUE;
-    }
-    else
-    {
-        *pdwSize = 0;
-        Result = FALSE;
+        *pMappable = {};
+        return nullptr;
     }
 
-    ReleaseSRWLockExclusive(&XwpAllocationLock);
-    return Result;
-}
-
-static void ReleaseAllocation(LPVOID lpAddress)
-{
-    AcquireSRWLockExclusive(&XwpAllocationLock);
-    XwpAllocations.erase(lpAddress);
-    ReleaseSRWLockExclusive(&XwpAllocationLock);
-}
-
-static void RegisterAllocation(LPVOID lpAddress, SIZE_T dwSize)
-{
-    AcquireSRWLockExclusive(&XwpAllocationLock);
-    XwpAllocations[lpAddress] = dwSize;
-    ReleaseSRWLockExclusive(&XwpAllocationLock);
+    --it;
+    *pMappable = it->second;
+    return (LPVOID)it->first;
 }
 
 EXTERN_C LPVOID WINAPI EraVirtualAllocEx(
@@ -207,89 +156,102 @@ EXTERN_C LPVOID WINAPI EraVirtualAllocEx(
     _In_ DWORD flAllocationType,
     _In_ DWORD flProtect)
 {
-    DWORD flOldProtect;
-    DWORD flNewAllocationType;
-    SIZE_T dwPageSize;
-    SIZE_T dwAllocationGranularity;
-    MEM_EXTENDED_PARAMETER ExtendedParam;
-    MEM_ADDRESS_REQUIREMENTS AddressRequirements;
-    GetAddressRequirements(lpAddress, flAllocationType, &AddressRequirements);
-    ExtendedParam.Type = MemExtendedParameterAddressRequirements;
-    ExtendedParam.Reserved = 0;
-    ExtendedParam.Pointer = &AddressRequirements;
-    flNewAllocationType = flAllocationType & (MEM_RESERVE | MEM_TOP_DOWN | MEM_WRITE_WATCH);
-
-    switch (flAllocationType & (MEM_LARGE_PAGES | MEM_4MB_PAGES))
-    {
-    case MEM_LARGE_PAGES:
-        dwPageSize = PAGE_SIZE_4KB;
-        dwAllocationGranularity = PAGE_SIZE_64K;
-        break;
-    case MEM_4MB_PAGES:
-        dwPageSize = PAGE_SIZE_2MB;
-        dwAllocationGranularity = PAGE_SIZE_4MB;
-        break;
-    default:
-        dwPageSize = PAGE_SIZE_4KB;
-        dwAllocationGranularity = PAGE_SIZE_64K;
-        break;
-    }
-
-    if (flAllocationType & MEM_TOP_DOWN)
-        flNewAllocationType |= MEM_RESERVE;
-
-    // Mask off ERA page protection flags.
-    flProtect &= PAGE_NOACCESS | PAGE_READONLY | PAGE_READWRITE;
-
-    if (flAllocationType & (MEM_RESET | MEM_RESET_UNDO))
-        return VirtualAlloc2(hProcess, lpAddress, dwSize, flAllocationType, PAGE_NOACCESS, nullptr, 0);
-
     if ((flAllocationType & (MEM_GRAPHICS | MEM_TITLE)) == (MEM_GRAPHICS | MEM_TITLE))
     {
         SetLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
     }
 
+    MEM_ADDRESS_REQUIREMENTS AddrRq;
+    AddrRq.LowestStartingAddress = nullptr;
+    AddrRq.HighestEndingAddress = nullptr;
+    AddrRq.Alignment = 0;
+
+    MEM_EXTENDED_PARAMETER ExtParam;
+    ExtParam.Type = MemExtendedParameterAddressRequirements;
+    ExtParam.Reserved = 0;
+    ExtParam.Pointer = &AddrRq;
+
+    // If true, the memory can be used with MapTitlePhysicalPages and D3DMapEsramMemory.
+    // These allocations go through a file mapping and therefore get handled differently.
+    BOOL bMappable = FALSE;
+    MAPPABLE_MEM Mappable = {};
+
     if (flAllocationType & (MEM_RESERVE | MEM_TOP_DOWN))
     {
-        // Round size up to allocation granularity
-        dwSize = (dwSize + (dwAllocationGranularity - 1)) & ~(dwAllocationGranularity - 1);
+        // If MEM_LARGE_PAGES or MEM_4MB_PAGES is specified, the memory is mappable.
+        bMappable = !!(flAllocationType & (MEM_LARGE_PAGES | MEM_4MB_PAGES));
 
-        // Round address down to allocation granularity
-        lpAddress = (PVOID)((ULONG_PTR)lpAddress & ~(dwAllocationGranularity - 1));
+        if (!lpAddress)
+        {
+            if (flAllocationType & MEM_4MB_PAGES)
+                AddrRq.Alignment = PAGE_SIZE_4MB;
 
-        // Reserve a placeholder for the entire allocation
-        lpAddress = VirtualAlloc2(hProcess, lpAddress, dwSize, flNewAllocationType | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, &ExtendedParam, 1);
+            // If we're reserving memory, ERA will use specific memory ranges.
+            // TODO: Does any set of flags use 1 TiB -> 2 TiB? Need to test on hardware.
+            if (flAllocationType & MEM_GRAPHICS) // 4 GiB -> 1 TiB
+            {
+                AddrRq.LowestStartingAddress = (PVOID)0x100000000ULL;
+                AddrRq.HighestEndingAddress = (PVOID)0xFFFFFFFFFFULL;
+            }
+            else if (flAllocationType & MEM_TITLE) // 2 TiB -> 4 TiB
+            {
+                AddrRq.LowestStartingAddress = (PVOID)0x40000000000ULL;
+                AddrRq.HighestEndingAddress = (PVOID)0x7FFFFFFFFFFULL;
+            }
+            else // 4 TiB -> 8 TiB
+            {
+                AddrRq.LowestStartingAddress = (PVOID)0x20000000000ULL;
+                AddrRq.HighestEndingAddress = (PVOID)0x3FFFFFFFFFFULL;
+            }
+        }
+    }
+    else if (lpAddress && (flAllocationType & MEM_COMMIT))
+    {
+        AcquireSRWLockShared(&XwpMappableLock);
+        bMappable = !!MappableQuery(lpAddress, &Mappable);
+        ReleaseSRWLockShared(&XwpMappableLock);
+    }
+
+    if (AddrRq.Alignment > 1)
+        dwSize = (dwSize + (AddrRq.Alignment - 1)) & ~(AddrRq.Alignment - 1);
+
+    if (!bMappable)
+        return VirtualAlloc2(hProcess, lpAddress, dwSize, flAllocationType & MEM_MASK, flProtect & PAGE_MASK, &ExtParam, 1);
+
+    SIZE_T dwPageSize = PAGE_SIZE_64K;
+
+    if (flAllocationType & (MEM_RESERVE | MEM_TOP_DOWN))
+    {
+        if (flAllocationType & MEM_4MB_PAGES)
+            dwPageSize = PAGE_SIZE_4MB;
+
+        if (lpAddress)
+            lpAddress = (LPVOID)((ULONG_PTR)lpAddress & ~(dwPageSize - 1));
+
+        dwSize = (dwSize + (dwPageSize - 1)) & ~(dwPageSize - 1);
+        lpAddress = VirtualAlloc2(hProcess, lpAddress, dwSize, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER | (flAllocationType & MEM_TOP_DOWN), PAGE_NOACCESS, &ExtParam, 1);
 
         if (lpAddress)
         {
-            // If the allocation was successful, register it.
-            RegisterAllocation(lpAddress, dwSize);
-        }
+            // Split the placeholder by the physical page size to enable individual mappings.
+            // This comes with its own caveats. MEM_COMMIT and other Virtual* functions must
+            // be aware of mappable memory allocations and handle them appropriately.
+            for (SIZE_T dwOffset = dwPageSize; dwOffset < dwSize; dwOffset += dwPageSize)
+                VirtualFreeEx(hProcess, (LPBYTE)lpAddress + dwOffset, dwPageSize, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
 
-        if (!(flAllocationType & MEM_COMMIT))
-        {
-            return lpAddress;
+            Mappable = { dwSize, !!(flAllocationType & MEM_4MB_PAGES) };
+            AcquireSRWLockExclusive(&XwpMappableLock);
+            XwpMappables[(ULONG_PTR)lpAddress] = Mappable;
+            ReleaseSRWLockExclusive(&XwpMappableLock);
         }
     }
 
-    if (flAllocationType & MEM_COMMIT)
+    if (lpAddress && (flAllocationType & MEM_COMMIT))
     {
-        // Round size up to page size
         dwSize = (dwSize + (dwPageSize - 1)) & ~(dwPageSize - 1);
-
-        // Round address down to page size
-        lpAddress = (PVOID)((ULONG_PTR)lpAddress & ~(dwPageSize - 1));
-
-        HANDLE hMap = CreateFileMapping2(
-            INVALID_HANDLE_VALUE,
-            nullptr,
-            FILE_MAP_READ | FILE_MAP_WRITE,
-            PAGE_READWRITE,
-            SEC_RESERVE,
-            dwSize,
-            nullptr,
-            nullptr, 0);
+        lpAddress = (LPVOID)((ULONG_PTR)lpAddress & ~(dwPageSize - 1));
+        HANDLE hMap = CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_READ | FILE_MAP_WRITE, PAGE_READWRITE, SEC_RESERVE, dwSize, nullptr, nullptr, 0);
 
         if (!hMap)
         {
@@ -297,38 +259,17 @@ EXTERN_C LPVOID WINAPI EraVirtualAllocEx(
             return nullptr;
         }
 
-        // Split the allocation into placeholders that can be mapped individually.
-        // TODO: This is inefficient. Investigate an implementation that only splits where needed.
-        // Splitting is required to support partial commit, but it doesn't need to split every page.
-        for (SIZE_T i = 0; i < dwSize / dwPageSize; i++)
+        for (SIZE_T dwOffset = 0; dwOffset < dwSize; dwOffset += dwPageSize)
         {
-            MEMORY_BASIC_INFORMATION info;
-
-            if (!VirtualQuery((LPBYTE)lpAddress + dwPageSize * i, &info, sizeof(info)))
-                continue;
-
-            if (info.State != MEM_RESERVE)
-                continue;
-
-            // Only do this if memory state is MEM_RESERVE. Otherwise we risk releasing committed memory.
-            // If the memory state is not MEM_RESERVE, then it should be split into placeholders already.
-            VirtualFreeEx(hProcess, (LPBYTE)lpAddress + dwPageSize * i, dwPageSize, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+            LPVOID PageAddress = (LPBYTE)lpAddress + dwOffset;
+            MapViewOfFile3(hMap, hProcess, PageAddress, dwOffset, dwPageSize, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0);
+            VirtualAlloc2(hProcess, PageAddress, dwPageSize, MEM_COMMIT, flProtect & PAGE_MASK, nullptr, 0);
         }
 
-        for (SIZE_T i = 0; i < dwSize / dwPageSize; i++)
-        {
-            LPVOID PageAddress = (LPBYTE)lpAddress + dwPageSize * i;
-            MapViewOfFile3(hMap, hProcess, PageAddress, dwPageSize * i, dwPageSize, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0);
-            VirtualAlloc2(hProcess, PageAddress, dwPageSize, MEM_COMMIT, flProtect, nullptr, 0);
-        }
-
-        VirtualProtectEx(hProcess, lpAddress, dwSize, flProtect, &flOldProtect);
         CloseHandle(hMap);
-        return lpAddress;
     }
 
-    SetLastError(ERROR_INVALID_PARAMETER);
-    return nullptr;
+    return lpAddress;
 }
 
 EXTERN_C LPVOID WINAPI EraVirtualAlloc(
@@ -346,54 +287,39 @@ EXTERN_C BOOL WINAPI EraVirtualFreeEx(
     _In_ SIZE_T dwSize,
     _In_ DWORD dwFreeType)
 {
-    MEMORY_BASIC_INFORMATION mbi;
+    LPVOID AllocationBase;
+    MAPPABLE_MEM Mappable;
+    AcquireSRWLockShared(&XwpMappableLock);
+    AllocationBase = MappableQuery(lpAddress, &Mappable);
+    ReleaseSRWLockShared(&XwpMappableLock);
 
-    if ((dwFreeType & (MEM_RELEASE | MEM_DECOMMIT)) == (MEM_RELEASE | MEM_DECOMMIT) ||
-        (dwFreeType == MEM_RELEASE && dwSize != 0))
+    // If we have a mappable allocation, we need to ensure it is unmapped first.
+    if (AllocationBase)
     {
-        SetLastError(ERROR_INVALID_PARAMETER);
-        return FALSE;
-    }
+        ULONG_PTR PageSize = Mappable.Is4MBPages ? PAGE_SIZE_4MB : PAGE_SIZE_64K;
+        ULONG_PTR BasePage = (ULONG_PTR)lpAddress & ~(PageSize - 1);
 
-    if (dwSize == 0 || dwFreeType == MEM_RELEASE)
-    {
-        if (!GetAllocationSize(lpAddress, &dwSize) || dwSize == 0)
-        {
-            SetLastError(ERROR_INVALID_PARAMETER);
-            return FALSE;
-        }
-    }
-
-    ULONG_PTR CurAddr = (ULONG_PTR)lpAddress;
-    ULONG_PTR EndAddr = (ULONG_PTR)lpAddress + dwSize;
-
-    // If there are any active views (i.e. from physical memory APIs),
-    // we need to unmap them to be able to release/decommit the memory.
-    while (CurAddr < EndAddr)
-    {
-        if (!VirtualQueryEx(hProcess, (LPCVOID)CurAddr, &mbi, sizeof(mbi)))
+        if (dwFreeType == MEM_RELEASE && (AllocationBase != lpAddress || dwSize))
             return FALSE;
 
-        if (mbi.Type & MEM_MAPPED)
-            UnmapViewOfFile2(hProcess, mbi.BaseAddress, MEM_PRESERVE_PLACEHOLDER);
+        if (dwFreeType == MEM_RELEASE || (dwFreeType == MEM_DECOMMIT && !dwSize))
+            dwSize = Mappable.RegionSize - ((ULONG_PTR)BasePage - (ULONG_PTR)AllocationBase);
 
-        CurAddr = (ULONG_PTR)mbi.BaseAddress + mbi.RegionSize;
+        ULONG_PTR LastPage = ((ULONG_PTR)lpAddress + dwSize) & ~(PageSize - 1);
+
+        for (ULONG_PTR BaseAddress = BasePage; BaseAddress <= LastPage; BaseAddress += PageSize)
+            UnmapViewOfFile2(hProcess, (PVOID)BaseAddress, MEM_PRESERVE_PLACEHOLDER);
+
+        if (dwFreeType == MEM_DECOMMIT)
+            return TRUE;
+    
+        dwSize = 0;
+        AcquireSRWLockExclusive(&XwpMappableLock);
+        XwpMappables.erase((ULONG_PTR)AllocationBase);
+        ReleaseSRWLockExclusive(&XwpMappableLock);
     }
 
-    // Coalesce the placeholders to merge everything back into a single allocation we can release.
-    VirtualFreeEx(hProcess, lpAddress, dwSize, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
-
-    // The allocation is now a placeholder with nothing mapped into it, we can consider that decommitted.
-    if (dwFreeType & MEM_DECOMMIT)
-        return TRUE;
-
-    if (VirtualFreeEx(hProcess, lpAddress, 0, dwFreeType))
-    {
-        ReleaseAllocation(lpAddress);
-        return TRUE;
-    }
-
-    return FALSE;
+    return VirtualFreeEx(hProcess, lpAddress, dwSize, dwFreeType);
 }
 
 EXTERN_C BOOL WINAPI EraVirtualFree(
@@ -402,6 +328,117 @@ EXTERN_C BOOL WINAPI EraVirtualFree(
     _In_ DWORD dwFreeType)
 {
     return EraVirtualFreeEx(GetCurrentProcess(), lpAddress, dwSize, dwFreeType);
+}
+
+EXTERN_C SIZE_T WINAPI EraVirtualQueryEx(
+    _In_ HANDLE hProcess,
+    _In_opt_ LPCVOID lpAddress,
+    _Out_writes_bytes_to_(dwLength, return) PMEMORY_BASIC_INFORMATION lpBuffer,
+    _In_ SIZE_T dwLength)
+{
+    LPVOID AllocationBase;
+    MAPPABLE_MEM Mappable;
+
+    if (!lpBuffer || dwLength < sizeof(*lpBuffer))
+        return 0;
+
+    AcquireSRWLockShared(&XwpMappableLock);
+    AllocationBase = MappableQuery(lpAddress, &Mappable);
+    ReleaseSRWLockShared(&XwpMappableLock);
+
+    // Mappable memory requires special handling because of placeholder splits.
+    // VirtualQuery will normally only report on pages that belong to the same allocation.
+    if (AllocationBase)
+    {
+        MEMORY_BASIC_INFORMATION Region;
+        ULONG_PTR PageSize = Mappable.Is4MBPages ? PAGE_SIZE_2MB : PAGE_SIZE_4KB;
+        ULONG_PTR BasePage = (ULONG_PTR)lpAddress & ~(PageSize - 1);
+        ULONG_PTR ByteSize = Mappable.RegionSize - ((ULONG_PTR)BasePage - (ULONG_PTR)AllocationBase);
+        ULONG_PTR LastPage = ((ULONG_PTR)lpAddress + ByteSize) & ~(PageSize - 1);
+        
+        if (!VirtualQueryEx(hProcess, (LPCVOID)BasePage, &Region, sizeof(Region)))
+            return 0;
+
+        lpBuffer->BaseAddress = (PVOID)BasePage;
+        lpBuffer->AllocationBase = AllocationBase;
+        lpBuffer->AllocationProtect = Region.AllocationProtect;
+        lpBuffer->PartitionId = Region.PartitionId;
+        lpBuffer->RegionSize = PageSize;
+        lpBuffer->State = Region.State;
+        lpBuffer->Protect = Region.Protect;
+        lpBuffer->Type = Region.Type;
+
+        for (ULONG_PTR Page = BasePage + PageSize; Page <= LastPage; Page += PageSize)
+        {
+            if (!VirtualQueryEx(hProcess, (LPCVOID)Page, &Region, sizeof(Region)))
+                break;
+
+            if (Region.State != lpBuffer->State || Region.Protect != lpBuffer->Protect)
+                break;
+
+            if (Region.RegionSize < PageSize)
+            {
+                lpBuffer->RegionSize += Region.RegionSize;
+                break;
+            }
+            
+            lpBuffer->RegionSize += PageSize;
+        }
+
+        return sizeof(*lpBuffer);
+    }
+
+    return VirtualQueryEx(hProcess, lpAddress, lpBuffer, dwLength);
+}
+
+EXTERN_C SIZE_T WINAPI EraVirtualQuery(
+    _In_opt_ LPCVOID lpAddress,
+    _Out_writes_bytes_to_(dwLength, return) PMEMORY_BASIC_INFORMATION lpBuffer,
+    _In_ SIZE_T dwLength)
+{
+    return EraVirtualQueryEx(GetCurrentProcess(), lpAddress, lpBuffer, dwLength);
+}
+
+EXTERN_C BOOL WINAPI EraVirtualProtectEx(
+    _In_ HANDLE hProcess,
+    _In_ LPVOID lpAddress,
+    _In_ SIZE_T dwSize,
+    _In_ DWORD flNewProtect,
+    _Out_opt_ PDWORD lpflOldProtect)
+{
+    DWORD flOldProtect;
+    LPVOID AllocationBase;
+    MAPPABLE_MEM Mappable;
+    AcquireSRWLockShared(&XwpMappableLock);
+    AllocationBase = MappableQuery(lpAddress, &Mappable);
+    ReleaseSRWLockShared(&XwpMappableLock);
+
+    // Mappable memory requires special handling because of placeholder splits.
+    // VirtualProtect will normally only work on pages that belong to the same allocation.
+    if (AllocationBase)
+    {
+        // TODO: Validate all pages are committed before changing protections
+        ULONG_PTR PageSize = Mappable.Is4MBPages ? PAGE_SIZE_2MB : PAGE_SIZE_4KB;
+        ULONG_PTR BasePage = (ULONG_PTR)lpAddress & ~(PageSize - 1);
+        ULONG_PTR LastPage = ((ULONG_PTR)lpAddress + dwSize) & ~(PageSize - 1);
+        BOOL Status = VirtualProtectEx(hProcess, (LPVOID)BasePage, PageSize, flNewProtect, lpflOldProtect ? lpflOldProtect : &flOldProtect);
+
+        for (ULONG_PTR Page = BasePage + PageSize; Page <= LastPage; Page += PageSize)
+            Status |= VirtualProtectEx(hProcess, (LPVOID)Page, PageSize, flNewProtect, &flOldProtect);
+        
+        return Status;
+    }
+
+    return VirtualProtectEx(hProcess, lpAddress, dwSize, flNewProtect, lpflOldProtect ? lpflOldProtect : &flOldProtect);
+}
+
+EXTERN_C BOOL WINAPI EraVirtualProtect(
+    _In_ LPVOID lpAddress,
+    _In_ SIZE_T dwSize,
+    _In_ DWORD flNewProtect,
+    _Out_opt_ PDWORD lpflOldProtect)
+{
+    return EraVirtualProtectEx(GetCurrentProcess(), lpAddress, dwSize, flNewProtect, lpflOldProtect);
 }
 
 //
@@ -527,11 +564,10 @@ EXTERN_C PVOID WINAPI MapTitlePhysicalPages(_In_opt_ PVOID VirtualAddress, _In_ 
         return nullptr;
     }
 
-    SIZE_T dwMemPageSize = (flAllocationType & MEM_LARGE_PAGES) ? PAGE_SIZE_64K : PAGE_SIZE_4MB;
-    SIZE_T dwCpuPageSize = (flAllocationType & MEM_LARGE_PAGES) ? PAGE_SIZE_4KB : PAGE_SIZE_2MB;
+    ULONG_PTR dwPageSize = (flAllocationType & MEM_LARGE_PAGES) ? PAGE_SIZE_64K : PAGE_SIZE_4MB;
     ULONG_PTR RegionSize = (flAllocationType & MEM_4MB_PAGES) ? 64 : 1;
 
-    if (VirtualAddress && ((ULONG_PTR)VirtualAddress & (dwMemPageSize - 1)))
+    if (VirtualAddress && ((ULONG_PTR)VirtualAddress & (dwPageSize - 1)))
     {
         SetLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
@@ -551,29 +587,13 @@ EXTERN_C PVOID WINAPI MapTitlePhysicalPages(_In_opt_ PVOID VirtualAddress, _In_ 
         }
     }
 
-    // Split the allocation into placeholders that can be mapped individually.
-    for (ULONG_PTR i = 0; i < (NumberOfPages * PAGE_SIZE_64K) / dwCpuPageSize; i++)
-    {
-        PVOID PageAddress = (PVOID)((ULONG_PTR)VirtualAddress + i * dwCpuPageSize);
-        UnmapViewOfFile2(GetCurrentProcess(), PageAddress, MEM_PRESERVE_PLACEHOLDER);
-        VirtualFreeEx(GetCurrentProcess(), PageAddress, dwCpuPageSize, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
-    }
-
-    // Mask off ERA page protection flags.
-    flProtect &= PAGE_NOACCESS | PAGE_READONLY | PAGE_READWRITE;
-
     for (ULONG_PTR i = 0; i < NumberOfPages; i += RegionSize)
     {
         ULONG_PTR PhysicalOffset = PAGE_SIZE_64K * PageArray[i];
         PVOID PageVirtualAddress = (PVOID)((ULONG_PTR)VirtualAddress + i * PAGE_SIZE_64K);
-
-        for (ULONG_PTR j = 0; j < dwMemPageSize / dwCpuPageSize; j++)
-        {
-            ULONG_PTR PageOffset = j * dwCpuPageSize;
-            PVOID CpuPageAddress = (PVOID)((ULONG_PTR)PageVirtualAddress + PageOffset);
-            MapViewOfFile3(XwpPhysicalMemory, nullptr, CpuPageAddress, PhysicalOffset + PageOffset, dwCpuPageSize, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0);
-            VirtualAlloc2(nullptr, CpuPageAddress, dwCpuPageSize, MEM_COMMIT, flProtect, nullptr, 0);
-        }
+        UnmapViewOfFile2(GetCurrentProcess(), PageVirtualAddress, MEM_PRESERVE_PLACEHOLDER);
+        MapViewOfFile3(XwpPhysicalMemory, nullptr, PageVirtualAddress, PhysicalOffset, dwPageSize, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0);
+        VirtualAlloc2(nullptr, PageVirtualAddress, dwPageSize, MEM_COMMIT, flProtect & PAGE_MASK, nullptr, 0);
     }
 
     SetLastError(ERROR_SUCCESS);
@@ -600,40 +620,35 @@ EXTERN_C HRESULT WINAPI MapTitleEsramPages(
         return E_INVALIDARG;
     }
 
-    SIZE_T dwMemPageSize = (flAllocationType & MEM_LARGE_PAGES) ? PAGE_SIZE_64K : PAGE_SIZE_4MB;
-    SIZE_T dwCpuPageSize = (flAllocationType & MEM_LARGE_PAGES) ? PAGE_SIZE_4KB : PAGE_SIZE_2MB;
+    SIZE_T dwPageSize = (flAllocationType & MEM_LARGE_PAGES) ? PAGE_SIZE_64K : PAGE_SIZE_4MB;
 
-    if (NumberOfPages * dwMemPageSize > MEM_ESRAM_SIZE)
+    if (NumberOfPages * dwPageSize > MEM_ESRAM_SIZE)
         return E_INVALIDARG;
 
-    if ((ULONG_PTR)VirtualAddress & (dwMemPageSize - 1))
+    if ((ULONG_PTR)VirtualAddress & (dwPageSize - 1))
         return E_INVALIDARG;
-
-    for (ULONG_PTR i = 0; i < (NumberOfPages * dwMemPageSize) / dwCpuPageSize; i++)
-    {
-        PVOID PageAddress = (PVOID)((ULONG_PTR)VirtualAddress + i * dwCpuPageSize);
-        UnmapViewOfFile2(GetCurrentProcess(), PageAddress, MEM_PRESERVE_PLACEHOLDER);
-        VirtualFreeEx(GetCurrentProcess(), PageAddress, dwCpuPageSize, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
-    }
 
     if (!PageArray)
+    {
+        for (ULONG_PTR dwOffset = 0; dwOffset < NumberOfPages * dwPageSize; dwOffset += dwPageSize)
+        {
+            PVOID PageAddress = (PVOID)((ULONG_PTR)VirtualAddress + dwOffset);
+            UnmapViewOfFile2(GetCurrentProcess(), PageAddress, MEM_PRESERVE_PLACEHOLDER);
+        }
+
         return S_OK;
+    }
 
     for (ULONG_PTR i = 0; i < NumberOfPages; i++)
     {
-        ULONG_PTR PhysicalOffset = i * dwMemPageSize;
-        PVOID PageVirtualAddress = (PVOID)((ULONG_PTR)VirtualAddress + i * dwMemPageSize);
+        ULONG_PTR PhysicalOffset = PageArray[i] * dwPageSize;
+        PVOID PageVirtualAddress = (PVOID)((ULONG_PTR)VirtualAddress + i * dwPageSize);
 
-        if (PhysicalOffset + dwMemPageSize > MEM_ESRAM_SIZE)
+        if (PhysicalOffset + dwPageSize > MEM_ESRAM_SIZE)
             return E_INVALIDARG;
 
-        for (ULONG_PTR j = 0; j < dwMemPageSize / dwCpuPageSize; j++)
-        {
-            ULONG_PTR PageOffset = j * dwCpuPageSize;
-            PVOID CpuPageAddress = (PVOID)((ULONG_PTR)PageVirtualAddress + PageOffset);
-            MapViewOfFile3(XwpEsramMemory, nullptr, CpuPageAddress, PhysicalOffset + PageOffset, dwCpuPageSize, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0);
-            VirtualAlloc2(nullptr, CpuPageAddress, dwCpuPageSize, MEM_COMMIT, PAGE_READWRITE, nullptr, 0);
-        }
+        MapViewOfFile3(XwpEsramMemory, nullptr, PageVirtualAddress, PhysicalOffset, dwPageSize, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0);
+        VirtualAlloc2(nullptr, PageVirtualAddress, dwPageSize, MEM_COMMIT, PAGE_READWRITE, nullptr, 0);
     }
 
     return S_OK;
@@ -1254,10 +1269,10 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 #pragma comment(linker, "/export:VirtualAllocEx=EraVirtualAllocEx")
 #pragma comment(linker, "/export:VirtualFree=EraVirtualFree")
 #pragma comment(linker, "/export:VirtualFreeEx=EraVirtualFreeEx")
-#pragma comment(linker, "/export:VirtualProtect=kernel32.VirtualProtect")
-#pragma comment(linker, "/export:VirtualProtectEx=kernel32.VirtualProtectEx")
-#pragma comment(linker, "/export:VirtualQuery=kernel32.VirtualQuery")
-#pragma comment(linker, "/export:VirtualQueryEx=kernel32.VirtualQueryEx")
+#pragma comment(linker, "/export:VirtualProtect=EraVirtualProtect")
+#pragma comment(linker, "/export:VirtualProtectEx=EraVirtualProtectEx")
+#pragma comment(linker, "/export:VirtualQuery=EraVirtualQuery")
+#pragma comment(linker, "/export:VirtualQueryEx=EraVirtualQueryEx")
 #pragma comment(linker, "/export:WaitForMultipleObjects=kernel32.WaitForMultipleObjects")
 #pragma comment(linker, "/export:WaitForMultipleObjectsEx=kernel32.WaitForMultipleObjectsEx")
 #pragma comment(linker, "/export:WaitForSingleObject=kernel32.WaitForSingleObject")
