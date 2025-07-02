@@ -156,12 +156,6 @@ EXTERN_C LPVOID WINAPI EraVirtualAllocEx(
     _In_ DWORD flAllocationType,
     _In_ DWORD flProtect)
 {
-    if ((flAllocationType & (MEM_GRAPHICS | MEM_TITLE)) == (MEM_GRAPHICS | MEM_TITLE))
-    {
-        SetLastError(ERROR_INVALID_PARAMETER);
-        return nullptr;
-    }
-
     MEM_ADDRESS_REQUIREMENTS AddrRq;
     AddrRq.LowestStartingAddress = nullptr;
     AddrRq.HighestEndingAddress = nullptr;
