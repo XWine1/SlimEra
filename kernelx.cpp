@@ -145,6 +145,13 @@ static LPVOID MappableQuery(_In_opt_ LPCVOID lpAddress, _Out_ PMAPPABLE_MEM pMap
     }
 
     --it;
+
+    if (it->first + it->second.RegionSize <= (ULONG_PTR)lpAddress)
+    {
+        *pMappable = {};
+        return nullptr;
+    }
+
     *pMappable = it->second;
     return (LPVOID)it->first;
 }
