@@ -663,10 +663,26 @@ EXTERN_C HRESULT WINAPI MapTitleEsramPages(
 //
 EXTERN_C PVOID WINAPI XMemAllocDefault(_In_ SIZE_T dwSize, _In_ ULONGLONG dwAttributes)
 {
-    if (XALLOC_IS_GRAPHICS(dwAttributes))
-        return EraVirtualAlloc(nullptr, dwSize, MEM_COMMIT | MEM_RESERVE | MEM_GRAPHICS, PAGE_READWRITE);
-
     auto attr = XALLOC_ATTRIBUTES { dwAttributes };
+
+    if (attr.s.dwMemoryType != XALLOC_MEMTYPE_HEAP)
+    {
+        DWORD flAllocationType = MEM_COMMIT | MEM_RESERVE;
+
+        if (attr.s.dwPageSize == XALLOC_PAGESIZE_4MB)
+            flAllocationType |= MEM_4MB_PAGES;
+        else
+            flAllocationType |= MEM_LARGE_PAGES;
+
+        if (attr.s.dwMemoryType >= XALLOC_MEMTYPE_GRAPHICS_1 &&
+            attr.s.dwMemoryType <= XALLOC_MEMTYPE_GRAPHICS_6)
+        {
+            flAllocationType |= MEM_GRAPHICS;
+        }
+
+        return EraVirtualAlloc(nullptr, dwSize, flAllocationType, PAGE_READWRITE);
+    }
+
     void *ptr = _aligned_malloc(dwSize, 1ULL << attr.s.dwAlignment);
 
     if (ptr)
@@ -677,7 +693,9 @@ EXTERN_C PVOID WINAPI XMemAllocDefault(_In_ SIZE_T dwSize, _In_ ULONGLONG dwAttr
 
 EXTERN_C void WINAPI XMemFreeDefault(_In_ PVOID lpAddress, _In_ ULONGLONG dwAttributes)
 {
-    if (XALLOC_IS_GRAPHICS(dwAttributes))
+    auto attr = XALLOC_ATTRIBUTES { dwAttributes };
+
+    if (attr.s.dwMemoryType != XALLOC_MEMTYPE_HEAP)
     {
         EraVirtualFree(lpAddress, 0, MEM_RELEASE);
         return;
