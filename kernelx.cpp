@@ -177,6 +177,7 @@ EXTERN_C LPVOID WINAPI EraVirtualAllocEx(
     // These allocations go through a file mapping and therefore get handled differently.
     BOOL bMappable = FALSE;
     MAPPABLE_MEM Mappable = {};
+    SIZE_T dwPageSize = PAGE_SIZE_4KB;
 
     if (flAllocationType & (MEM_RESERVE | MEM_TOP_DOWN))
     {
@@ -214,23 +215,20 @@ EXTERN_C LPVOID WINAPI EraVirtualAllocEx(
         ReleaseSRWLockShared(&XwpMappableLock);
     }
 
-    if (AddrRq.Alignment > 1)
-        dwSize = (dwSize + (AddrRq.Alignment - 1)) & ~(AddrRq.Alignment - 1);
-
     if (!bMappable)
         return VirtualAlloc2(hProcess, lpAddress, dwSize, flAllocationType & MEM_MASK, flProtect & PAGE_MASK, &ExtParam, 1);
 
-    SIZE_T dwPageSize = PAGE_SIZE_64K;
+    if ((flAllocationType & MEM_4MB_PAGES) || Mappable.Is4MBPages)
+        dwPageSize = PAGE_SIZE_4MB;
+    else
+        dwPageSize = PAGE_SIZE_64K;
+
+    dwSize = (dwSize + (dwPageSize - 1)) & ~(dwPageSize - 1);
+    lpAddress = (LPVOID)((ULONG_PTR)lpAddress & ~(dwPageSize - 1));
 
     if (flAllocationType & (MEM_RESERVE | MEM_TOP_DOWN))
     {
-        if (flAllocationType & MEM_4MB_PAGES)
-            dwPageSize = PAGE_SIZE_4MB;
-
-        if (lpAddress)
-            lpAddress = (LPVOID)((ULONG_PTR)lpAddress & ~(dwPageSize - 1));
-
-        dwSize = (dwSize + (dwPageSize - 1)) & ~(dwPageSize - 1);
+        Mappable = { dwSize, !!(flAllocationType & MEM_4MB_PAGES) };
         lpAddress = VirtualAlloc2(hProcess, lpAddress, dwSize, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER | (flAllocationType & MEM_TOP_DOWN), PAGE_NOACCESS, &ExtParam, 1);
 
         if (lpAddress)
@@ -241,7 +239,6 @@ EXTERN_C LPVOID WINAPI EraVirtualAllocEx(
             for (SIZE_T dwOffset = dwPageSize; dwOffset < dwSize; dwOffset += dwPageSize)
                 VirtualFreeEx(hProcess, (LPBYTE)lpAddress + dwOffset, dwPageSize, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
 
-            Mappable = { dwSize, !!(flAllocationType & MEM_4MB_PAGES) };
             AcquireSRWLockExclusive(&XwpMappableLock);
             XwpMappables[(ULONG_PTR)lpAddress] = Mappable;
             ReleaseSRWLockExclusive(&XwpMappableLock);
@@ -250,8 +247,6 @@ EXTERN_C LPVOID WINAPI EraVirtualAllocEx(
 
     if (lpAddress && (flAllocationType & MEM_COMMIT))
     {
-        dwSize = (dwSize + (dwPageSize - 1)) & ~(dwPageSize - 1);
-        lpAddress = (LPVOID)((ULONG_PTR)lpAddress & ~(dwPageSize - 1));
         HANDLE hMap = CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_READ | FILE_MAP_WRITE, PAGE_READWRITE, SEC_RESERVE, dwSize, nullptr, nullptr, 0);
 
         if (!hMap)
