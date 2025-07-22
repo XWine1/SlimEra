@@ -678,7 +678,7 @@ EXTERN_C PVOID WINAPI XMemAllocDefault(_In_ SIZE_T dwSize, _In_ ULONGLONG dwAttr
         return EraVirtualAlloc(nullptr, dwSize, flAllocationType, PAGE_READWRITE);
     }
 
-    void *ptr = _aligned_malloc(dwSize, 1ULL << attr.s.dwAlignment);
+    void *ptr = _aligned_malloc(dwSize, 1ULL << max(4, attr.s.dwAlignment));
 
     if (ptr)
         memset(ptr, 0, dwSize);
